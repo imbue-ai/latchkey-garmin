@@ -334,8 +334,9 @@ export function createGarmin(sdk) {
             if (this.serviceTicket === null) {
                 throw new LoginFailedError('The Garmin login finished without a service ticket.');
             }
+            // In thick-client mode the page goes to the embed page by itself.
             const page = context.pages()[0];
-            if (page !== undefined) {
+            if (page !== undefined && !page.url().startsWith(SSO_EMBED_URL)) {
                 await page.goto(SSO_EMBED_URL).catch(() => undefined);
             }
             const cookies = await context.cookies(PREAUTHORIZED_URL);
