@@ -1,0 +1,536 @@
+/**
+ * Garmin Connect, through the Connect mobile app's own OAuth tokens.
+ *
+ * Garmin offers individuals no public API. What the Connect phone app (and
+ * garth, python-garminconnect and GarminDB after it) uses is
+ * connectapi.garmin.com, where every call carries an OAuth2 bearer that
+ * expires after about an hour. A fresh bearer is minted by an OAuth1-signed
+ * request (HMAC-SHA1 over a nonce, a timestamp and a token secret), and the
+ * OAuth1 token behind it lasts about a year.
+ *
+ * Hence:
+ * - Login (`latchkey auth browser garmin`): the user signs into the mobile
+ *   app's own SSO page, which ends by handing a service ticket to the app.
+ *   The plugin trades that ticket for the OAuth1 token and the first bearer.
+ *   Alternatively, `latchkey auth set-nocurl garmin ~/.garth` imports the
+ *   OAuth1 token from a directory garth (or anything else writing its format)
+ *   has logged into.
+ * - Injection: `Authorization: Bearer <token>` on requests to connectapi.
+ * - Refresh: when a request finds the bearer expired, the plugin mints a new
+ *   one with the OAuth1 token. No browser is involved.
+ *
+ * The login flow follows garth's (https://github.com/matin/garth, MIT).
+ *
+ * All of this rides Garmin's undocumented first-party API, which is why it is
+ * a plugin rather than a built-in service. It can stop working whenever Garmin
+ * changes the Connect app's sign-in.
+ */
+
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import type {
+  ApiCredentials,
+  BrowserContext,
+  LatchkeySdk,
+  Page,
+  Response,
+  z as zod,
+} from 'latchkey/plugin';
+import {
+  type FormParameters,
+  type OAuth1Consumer,
+  type OAuth1Token,
+  buildOAuth1AuthorizationHeader,
+  formEncode,
+  freshNonce,
+  percentEncode,
+} from './oauth1.js';
+
+/**
+ * The Connect mobile app's OAuth1 consumer, as garth publishes it at
+ * https://thegarth.s3.amazonaws.com/oauth_consumer.json. Pinned rather than
+ * fetched, so that minting a bearer does not depend on that bucket.
+ */
+const CONNECT_MOBILE_CONSUMER: OAuth1Consumer = {
+  key: 'fc3e99d2-118c-44b8-8ae3-03370dde24c0',
+  secret: 'E08WAR897WEy2knn7aFBrvegVAf0AFdWBBF',
+};
+
+const DOMAIN = 'garmin.com';
+const SSO_CLIENT_ID = 'GCM_ANDROID_DARK';
+// Where the SSO page sends the service ticket once the user is signed in. The
+// host does not resolve: the phone app intercepts the navigation, and so does
+// the login session below.
+const SSO_SERVICE_URL = `https://mobile.integration.${DOMAIN}/gcm/android`;
+const SIGN_IN_URL =
+  `https://sso.${DOMAIN}/mobile/sso/en/sign-in?clientId=${SSO_CLIENT_ID}` +
+  `&service=${percentEncode(SSO_SERVICE_URL)}`;
+const SSO_API_URL_PREFIX = `https://sso.${DOMAIN}/mobile/api/`;
+// Best effort: the embed page sets a load-balancer cookie that pins the ticket
+// exchange to the backend that knows the ticket.
+const SSO_EMBED_URL = `https://sso.${DOMAIN}/portal/sso/embed`;
+
+const CONNECT_API_BASE_URL = `https://connectapi.${DOMAIN}/`;
+const PREAUTHORIZED_URL = `${CONNECT_API_BASE_URL}oauth-service/oauth/preauthorized`;
+const EXCHANGE_URL = `${CONNECT_API_BASE_URL}oauth-service/oauth/exchange/user/2.0`;
+const SOCIAL_PROFILE_URL = `${CONNECT_API_BASE_URL}userprofile-service/socialProfile`;
+
+// What the OAuth endpoints expect to see beside the consumer.
+const OAUTH_USER_AGENT = 'com.garmin.android.apps.connectmobile';
+// The audience the mobile app names when minting its first bearer after a login.
+const LOGIN_AUDIENCE = 'GARMIN_CONNECT_MOBILE_ANDROID_DI';
+
+const GARTH_OAUTH1_FILENAME = 'oauth1_token.json';
+
+// Bearers are re-minted this long before they actually expire, so a request
+// that is about to go out does not hit the boundary.
+const EXPIRY_MARGIN_MS = 120_000;
+const DEFAULT_BEARER_LIFETIME_SECONDS = 3600;
+const REQUEST_TIMEOUT_SECONDS = 30;
+
+export class GarminRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GarminRequestError';
+  }
+}
+
+export class GarminTokenExchangeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GarminTokenExchangeError';
+  }
+}
+
+/**
+ * The service ticket in a URL the SSO page navigated to, if it is the one
+ * that hands the ticket over. Exported for the tests.
+ */
+export function extractServiceTicketFromUrl(rawUrl: string): string | null {
+  if (!rawUrl.startsWith(`${SSO_SERVICE_URL}?`)) {
+    return null;
+  }
+  return new URL(rawUrl).searchParams.get('ticket');
+}
+
+export function createGarmin(sdk: LatchkeySdk) {
+  const {
+    ApiCredentialsUsageError,
+    BrowserFollowupServiceSession,
+    FollowupWork,
+    LoginFailedError,
+    NoCurlCredentialsNotSupportedError,
+    Service,
+    fetchAccountFromEndpoint,
+    runCurlCapturedAsync,
+    tryParseJson,
+    z,
+  } = sdk;
+
+  // What `latchkey auth set-nocurl` reports to the user when it cannot use
+  // what it was handed.
+  class GarminCredentialArgumentsError extends NoCurlCredentialsNotSupportedError {
+    constructor(message: string) {
+      super('garmin');
+      this.message = message;
+      this.name = 'GarminCredentialArgumentsError';
+    }
+  }
+
+  // ─── Credentials ────────────────────────────────────────────────────────────
+
+  /**
+   * Stored Garmin credentials: the year-long OAuth1 token, plus the hour-long
+   * bearer last minted with it and when that bearer expires. Credentials
+   * imported from garth hold no bearer yet; one is minted on first use.
+   */
+  const GarminCredentialsSchema = z.object({
+    objectType: z.literal('garminOAuth'),
+    oauthToken: z.string(),
+    oauthTokenSecret: z.string(),
+    mfaToken: z.string().optional(),
+    accessToken: z.string().optional(),
+    accessTokenExpiresAt: z.string().datetime().optional(),
+  });
+
+  type GarminCredentialsData = zod.infer<typeof GarminCredentialsSchema>;
+
+  class GarminCredentials implements ApiCredentials {
+    static readonly objectType = 'garminOAuth' as const;
+    readonly objectType = GarminCredentials.objectType;
+
+    constructor(
+      readonly oauthToken: string,
+      readonly oauthTokenSecret: string,
+      readonly mfaToken?: string,
+      readonly accessToken?: string,
+      readonly accessTokenExpiresAt?: string
+    ) {}
+
+    get oauth1Token(): OAuth1Token {
+      return { key: this.oauthToken, secret: this.oauthTokenSecret };
+    }
+
+    injectIntoCurlCall(curlArguments: readonly string[]): Promise<readonly string[]> {
+      if (this.accessToken === undefined) {
+        throw new ApiCredentialsUsageError(
+          'Garmin credentials hold no bearer yet. One is minted from the OAuth1 token ' +
+            'when a request is made.'
+        );
+      }
+      return Promise.resolve(['-H', `Authorization: Bearer ${this.accessToken}`, ...curlArguments]);
+    }
+
+    // Expired credentials are what Latchkey asks the service to refresh, so
+    // credentials without a bearer count as expired too: minting one is the
+    // refresh.
+    isExpired(): boolean {
+      if (this.accessToken === undefined || this.accessTokenExpiresAt === undefined) {
+        return true;
+      }
+      return Date.now() >= new Date(this.accessTokenExpiresAt).getTime() - EXPIRY_MARGIN_MS;
+    }
+
+    toJSON(): GarminCredentialsData {
+      return {
+        objectType: this.objectType,
+        oauthToken: this.oauthToken,
+        oauthTokenSecret: this.oauthTokenSecret,
+        mfaToken: this.mfaToken,
+        accessToken: this.accessToken,
+        accessTokenExpiresAt: this.accessTokenExpiresAt,
+      };
+    }
+
+    static fromJSON(data: unknown): GarminCredentials {
+      const parsed = GarminCredentialsSchema.parse(data);
+      return new GarminCredentials(
+        parsed.oauthToken,
+        parsed.oauthTokenSecret,
+        parsed.mfaToken,
+        parsed.accessToken,
+        parsed.accessTokenExpiresAt
+      );
+    }
+  }
+
+  // ─── Talking to the OAuth endpoints ─────────────────────────────────────────
+
+  interface GarminResponse {
+    readonly status: number;
+    readonly body: string;
+  }
+
+  async function requestGarmin(curlArguments: readonly string[]): Promise<GarminResponse> {
+    const result = await runCurlCapturedAsync(
+      ['-sS', '-w', '\n%{http_code}', ...curlArguments],
+      REQUEST_TIMEOUT_SECONDS
+    );
+    if (result.returncode !== 0) {
+      throw new GarminRequestError(`curl failed talking to Garmin: ${result.stderr.trim()}`);
+    }
+    const separatorIndex = result.stdout.lastIndexOf('\n');
+    return {
+      status: Number(result.stdout.slice(separatorIndex + 1).trim()),
+      body: separatorIndex === -1 ? '' : result.stdout.slice(0, separatorIndex),
+    };
+  }
+
+  function excerpt(body: string): string {
+    return body.slice(0, 300);
+  }
+
+  const ExchangeResponseSchema = z.object({
+    access_token: z.string(),
+    expires_in: z.number().optional(),
+  });
+
+  /**
+   * Mint a bearer with the OAuth1 token. `isAfterLogin` is true only for the
+   * first bearer after a login, where the mobile app names its audience.
+   */
+  async function exchangeForBearer(
+    oauthToken: string,
+    oauthTokenSecret: string,
+    mfaToken: string | undefined,
+    isAfterLogin: boolean
+  ): Promise<GarminCredentials> {
+    const form: FormParameters = [
+      ...(isAfterLogin ? [['audience', LOGIN_AUDIENCE] as const] : []),
+      ...(mfaToken === undefined ? [] : [['mfa_token', mfaToken] as const]),
+    ];
+    const authorization = buildOAuth1AuthorizationHeader(
+      'POST',
+      EXCHANGE_URL,
+      form,
+      CONNECT_MOBILE_CONSUMER,
+      { key: oauthToken, secret: oauthTokenSecret },
+      freshNonce()
+    );
+    const response = await requestGarmin([
+      '-X',
+      'POST',
+      '-H',
+      `User-Agent: ${OAUTH_USER_AGENT}`,
+      '-H',
+      `Authorization: ${authorization}`,
+      '-H',
+      'Content-Type: application/x-www-form-urlencoded',
+      '--data-binary',
+      formEncode(form),
+      EXCHANGE_URL,
+    ]);
+    if (response.status !== 200) {
+      throw new GarminTokenExchangeError(
+        `Garmin refused to mint a bearer (HTTP ${String(response.status)}: ` +
+          `${excerpt(response.body)}). The OAuth1 token has probably expired (they last ` +
+          'about a year); log in again with `latchkey auth browser garmin`.'
+      );
+    }
+    const parsed = ExchangeResponseSchema.safeParse(tryParseJson(response.body));
+    if (!parsed.success) {
+      throw new GarminTokenExchangeError(
+        `Garmin answered the bearer exchange in an unexpected shape: ${excerpt(response.body)}`
+      );
+    }
+    const lifetimeSeconds = parsed.data.expires_in ?? DEFAULT_BEARER_LIFETIME_SECONDS;
+    return new GarminCredentials(
+      oauthToken,
+      oauthTokenSecret,
+      mfaToken,
+      parsed.data.access_token,
+      new Date(Date.now() + lifetimeSeconds * 1000).toISOString()
+    );
+  }
+
+  /**
+   * Trade a service ticket for the OAuth1 token, then mint the first bearer.
+   * The ticket exchange is signed by the consumer alone.
+   */
+  async function logInWithServiceTicket(
+    serviceTicket: string,
+    cookieHeader: string
+  ): Promise<GarminCredentials> {
+    const url =
+      `${PREAUTHORIZED_URL}?ticket=${percentEncode(serviceTicket)}` +
+      `&login-url=${percentEncode(SSO_SERVICE_URL)}&accepts-mfa-tokens=true`;
+    const authorization = buildOAuth1AuthorizationHeader(
+      'GET',
+      url,
+      [],
+      CONNECT_MOBILE_CONSUMER,
+      undefined,
+      freshNonce()
+    );
+    const response = await requestGarmin([
+      '-H',
+      `User-Agent: ${OAUTH_USER_AGENT}`,
+      '-H',
+      `Authorization: ${authorization}`,
+      ...(cookieHeader === '' ? [] : ['-H', `Cookie: ${cookieHeader}`]),
+      url,
+    ]);
+    if (response.status !== 200) {
+      throw new LoginFailedError(
+        `Garmin refused the service ticket (HTTP ${String(response.status)}: ` +
+          `${excerpt(response.body)}).`
+      );
+    }
+    // The reply is form-encoded, not JSON.
+    const fields = new URLSearchParams(response.body.trim());
+    const oauthToken = fields.get('oauth_token');
+    const oauthTokenSecret = fields.get('oauth_token_secret');
+    if (oauthToken === null || oauthTokenSecret === null) {
+      throw new LoginFailedError(
+        `Garmin's ticket exchange returned no OAuth1 token: ${excerpt(response.body)}`
+      );
+    }
+    const mfaToken = fields.get('mfa_token') ?? '';
+    return await exchangeForBearer(
+      oauthToken,
+      oauthTokenSecret,
+      mfaToken === '' ? undefined : mfaToken,
+      true
+    );
+  }
+
+  // ─── Importing from garth ───────────────────────────────────────────────────
+
+  const GarthOAuth1TokenSchema = z.object({
+    oauth_token: z.string(),
+    oauth_token_secret: z.string(),
+    mfa_token: z.string().nullish(),
+    domain: z.string().nullish(),
+  });
+
+  function expandHomeDirectory(path: string): string {
+    return path === '~' || path.startsWith('~/') ? join(homedir(), path.slice(1)) : path;
+  }
+
+  function readGarthCredentials(directory: string): GarminCredentials {
+    const path = join(expandHomeDirectory(directory), GARTH_OAUTH1_FILENAME);
+    let contents: string;
+    try {
+      contents = readFileSync(path, 'utf-8');
+    } catch {
+      throw new GarminCredentialArgumentsError(
+        `Could not read ${path}. Expected a directory garth has saved its tokens to.`
+      );
+    }
+    const parsed = GarthOAuth1TokenSchema.safeParse(tryParseJson(contents));
+    if (!parsed.success) {
+      throw new GarminCredentialArgumentsError(`${path} is not a garth OAuth1 token file.`);
+    }
+    const { oauth_token, oauth_token_secret, mfa_token, domain } = parsed.data;
+    if (domain !== undefined && domain !== null && domain !== DOMAIN) {
+      throw new GarminCredentialArgumentsError(
+        `The token in ${path} is for ${domain}; only ${DOMAIN} is supported.`
+      );
+    }
+    return new GarminCredentials(oauth_token, oauth_token_secret, mfa_token ?? undefined);
+  }
+
+  // ─── Login ──────────────────────────────────────────────────────────────────
+
+  const SsoResponseSchema = z.object({
+    responseStatus: z.object({ type: z.literal('SUCCESSFUL') }),
+    serviceTicketId: z.string(),
+  });
+
+  /**
+   * The user signs into the mobile app's SSO page, which ends by navigating
+   * to the app's service URL with a ticket. The ticket is picked up from the
+   * SSO API reply that carries it or, should that reply's body already be gone
+   * by the time it is read, from the navigation itself.
+   */
+  class GarminServiceSession extends BrowserFollowupServiceSession {
+    protected readonly followupWork = FollowupWork.RetrieveApiToken;
+    private serviceTicket: string | null = null;
+    private isWatchingRequests = false;
+
+    get capturedServiceTicket(): string | null {
+      return this.serviceTicket;
+    }
+
+    async onResponse(response: Response): Promise<void> {
+      if (this.serviceTicket !== null || !response.url().startsWith(SSO_API_URL_PREFIX)) {
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        return;
+      }
+      const parsed = SsoResponseSchema.safeParse(body);
+      if (parsed.success) {
+        this.serviceTicket ??= parsed.data.serviceTicketId;
+      }
+    }
+
+    noteRequestUrl(url: string): void {
+      this.serviceTicket ??= extractServiceTicketFromUrl(url);
+    }
+
+    // The navigation that hands the ticket over never gets a response (its host
+    // does not resolve), so the session watches requests as well.
+    override whileWaitingForLogin(page: Page): Promise<void> {
+      if (!this.isWatchingRequests) {
+        page.context().on('request', (request) => {
+          this.noteRequestUrl(request.url());
+        });
+        this.isWatchingRequests = true;
+      }
+      return Promise.resolve();
+    }
+
+    protected isLoginComplete(): boolean {
+      return this.serviceTicket !== null;
+    }
+
+    protected async performBrowserFollowup(context: BrowserContext): Promise<ApiCredentials> {
+      if (this.serviceTicket === null) {
+        throw new LoginFailedError('The Garmin login finished without a service ticket.');
+      }
+      const page = context.pages()[0];
+      if (page !== undefined) {
+        await page.goto(SSO_EMBED_URL).catch(() => undefined);
+      }
+      const cookies = await context.cookies(PREAUTHORIZED_URL);
+      const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
+      return await logInWithServiceTicket(this.serviceTicket, cookieHeader);
+    }
+  }
+
+  // ─── Service ────────────────────────────────────────────────────────────────
+
+  const SocialProfileSchema = z.object({
+    userName: z.string().optional(),
+    displayName: z.string().optional(),
+  });
+
+  class Garmin extends Service {
+    readonly name = 'garmin';
+    readonly displayName = 'Garmin Connect';
+    readonly baseApiUrls = [CONNECT_API_BASE_URL] as const;
+    readonly loginUrl = SIGN_IN_URL;
+    readonly info = [
+      `Garmin Connect, through the Connect mobile app's own API at ${CONNECT_API_BASE_URL} ` +
+        '(undocumented; the same API garth and python-garminconnect use).',
+      `Known endpoint: GET ${SOCIAL_PROFILE_URL} returns the signed-in user's profile, whose ` +
+        'displayName is what per-user paths expect.',
+      "This relies on Garmin's first-party mobile client and may break when Garmin changes it.",
+    ].join(' ');
+
+    // A cheap read that only a valid bearer gets a 200 for.
+    readonly credentialCheckCurlArguments = [SOCIAL_PROFILE_URL] as const;
+
+    setCredentialsExample(serviceName: string): string {
+      return `latchkey auth set-nocurl ${serviceName} ~/.garth`;
+    }
+
+    override getCredentialsNoCurl(noCurlArguments: readonly string[]): ApiCredentials {
+      const [directory, ...unexpected] = noCurlArguments;
+      if (directory === undefined || unexpected.length > 0) {
+        throw new GarminCredentialArgumentsError(
+          `Expected exactly one argument, a directory holding garth's ${GARTH_OAUTH1_FILENAME}. ` +
+            `Example: ${this.setCredentialsExample(this.name)}`
+        );
+      }
+      return readGarthCredentials(directory);
+    }
+
+    override getSession(appNamePrefix: string): GarminServiceSession {
+      return new GarminServiceSession(this, appNamePrefix);
+    }
+
+    override async getAccount(apiCredentials: ApiCredentials): Promise<string | null> {
+      return await fetchAccountFromEndpoint(apiCredentials, [SOCIAL_PROFILE_URL], (body) => {
+        const parsed = SocialProfileSchema.safeParse(tryParseJson(body));
+        return parsed.success ? (parsed.data.userName ?? parsed.data.displayName ?? null) : null;
+      });
+    }
+
+    /**
+     * Mint a fresh bearer with the stored OAuth1 token. Latchkey calls this
+     * only when a request finds the bearer expired, so idle credentials cost
+     * nothing.
+     */
+    override async refreshCredentials(
+      apiCredentials: ApiCredentials
+    ): Promise<ApiCredentials | null> {
+      if (!(apiCredentials instanceof GarminCredentials)) {
+        return null;
+      }
+      return await exchangeForBearer(
+        apiCredentials.oauthToken,
+        apiCredentials.oauthTokenSecret,
+        apiCredentials.mfaToken,
+        false
+      );
+    }
+  }
+
+  return { Garmin, GarminCredentials, GarminServiceSession, logInWithServiceTicket };
+}
