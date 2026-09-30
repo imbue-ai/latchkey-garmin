@@ -2,7 +2,6 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Response } from 'latchkey/plugin';
 import { createLatchkeySdk } from 'latchkey/dist/src/pluginSdk.js';
 import { resetAsyncSubprocessRunner, setAsyncSubprocessRunner } from 'latchkey/dist/src/curl.js';
 import plugin from '../src/index.js';
@@ -201,24 +200,18 @@ describe('refreshing', () => {
 });
 
 describe('the browser login', () => {
-  function fakeResponse(url: string, body: unknown): Response {
-    return { url: () => url, json: () => Promise.resolve(body) } as unknown as Response;
-  }
-
-  it('takes the service ticket from the SSO API reply', async () => {
+  it('takes the service ticket from what the SSO page tells the app', () => {
     const session = garmin.getSession('latchkey');
 
-    await session.onResponse(
-      fakeResponse('https://sso.garmin.com/mobile/api/login?clientId=GCM_ANDROID_DARK', {
-        responseStatus: { type: 'MFA_REQUIRED' },
-      })
-    );
+    session.noteThickClientEvent(JSON.stringify({ eventType: 'PAGE_LOAD', data: { title: '' } }));
     expect(session.capturedServiceTicket).toBeNull();
 
-    await session.onResponse(
-      fakeResponse('https://sso.garmin.com/mobile/api/mfa/verifyCode?clientId=GCM_ANDROID_DARK', {
-        responseStatus: { type: 'SUCCESSFUL' },
-        serviceTicketId: 'ST-123',
+    session.noteThickClientEvent(
+      JSON.stringify({
+        eventType: 'USER_AUTHENTICATED',
+        flowName: 'AUTHENTICATION',
+        logMessage: '',
+        data: { serviceTicket: 'ST-123', serviceUrl: SERVICE_URL },
       })
     );
     expect(session.capturedServiceTicket).toBe('ST-123');

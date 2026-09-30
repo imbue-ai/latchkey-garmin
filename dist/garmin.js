@@ -10,8 +10,9 @@
  *
  * Hence:
  * - Login (`latchkey auth browser garmin`): the user signs into the mobile
- *   app's own SSO page, which ends by handing a service ticket to the app.
- *   The plugin trades that ticket for the OAuth1 token and the first bearer.
+ *   app's own SSO page, which ends by handing a service ticket to the app;
+ *   the plugin stands in for the app there. It trades that ticket for the
+ *   OAuth1 token and the first bearer.
  *   Alternatively, `latchkey auth set-nocurl garmin ~/.garth` imports the
  *   OAuth1 token from a directory garth (or anything else writing its format)
  *   has logged into.
@@ -40,13 +41,15 @@ const CONNECT_MOBILE_CONSUMER = {
 };
 const DOMAIN = 'garmin.com';
 const SSO_CLIENT_ID = 'GCM_ANDROID_DARK';
-// Where the SSO page sends the service ticket once the user is signed in. The
-// host does not resolve: the phone app intercepts the navigation, and so does
-// the login session below.
+// The service the SSO page issues its ticket for. Its host does not resolve:
+// it only ever reaches the phone app.
 const SSO_SERVICE_URL = `https://mobile.integration.${DOMAIN}/gcm/android`;
 const SIGN_IN_URL = `https://sso.${DOMAIN}/mobile/sso/en/sign-in?clientId=${SSO_CLIENT_ID}` +
     `&service=${percentEncode(SSO_SERVICE_URL)}`;
-const SSO_API_URL_PREFIX = `https://sso.${DOMAIN}/mobile/api/`;
+// The bridge the phone app gives the SSO page to report events through, and
+// the function the session exposes to stand in for the app.
+const THICK_CLIENT_BINDING_NAME = 'latchkeyGarminEvent';
+const THICK_CLIENT_BRIDGE_SCRIPT = `window.GMNEventHandler = { handleEvent: (event) => window.${THICK_CLIENT_BINDING_NAME}(event) };`;
 // Best effort: the embed page sets a load-balancer cookie that pins the ticket
 // exchange to the backend that knows the ticket.
 const SSO_EMBED_URL = `https://sso.${DOMAIN}/portal/sso/embed`;
@@ -273,52 +276,56 @@ export function createGarmin(sdk) {
         return new GarminCredentials(oauth_token, oauth_token_secret, mfa_token ?? undefined);
     }
     // ─── Login ──────────────────────────────────────────────────────────────────
-    const SsoResponseSchema = z.object({
-        responseStatus: z.object({ type: z.literal('SUCCESSFUL') }),
-        serviceTicketId: z.string(),
+    // What the SSO page tells the phone app once the user is signed in.
+    const ThickClientEventSchema = z.object({
+        eventType: z.literal('USER_AUTHENTICATED'),
+        data: z.object({ serviceTicket: z.string() }),
     });
     /**
-     * The user signs into the mobile app's SSO page, which ends by navigating
-     * to the app's service URL with a ticket. The ticket is picked up from the
-     * SSO API reply that carries it or, should that reply's body already be gone
-     * by the time it is read, from the navigation itself.
+     * The user signs into the mobile app's SSO page, which hands the resulting
+     * service ticket to the app. Garmin configures this client as a "thick
+     * client", so the page does that by calling `window.GMNEventHandler`, the
+     * bridge the app provides; the session provides it instead. Should Garmin
+     * turn that off, the page navigates to the app's service URL with the
+     * ticket, which the session watches for as well.
      */
     class GarminServiceSession extends BrowserFollowupServiceSession {
         followupWork = FollowupWork.RetrieveApiToken;
         serviceTicket = null;
-        isWatchingRequests = false;
+        isListening = false;
         get capturedServiceTicket() {
             return this.serviceTicket;
         }
-        async onResponse(response) {
-            if (this.serviceTicket !== null || !response.url().startsWith(SSO_API_URL_PREFIX)) {
+        onResponse(_response) {
+            // The ticket arrives through the bridge or a request, not a response.
+        }
+        noteThickClientEvent(eventJson) {
+            if (typeof eventJson !== 'string') {
                 return;
             }
-            let body;
-            try {
-                body = await response.json();
-            }
-            catch {
-                return;
-            }
-            const parsed = SsoResponseSchema.safeParse(body);
+            const parsed = ThickClientEventSchema.safeParse(tryParseJson(eventJson));
             if (parsed.success) {
-                this.serviceTicket ??= parsed.data.serviceTicketId;
+                this.serviceTicket ??= parsed.data.data.serviceTicket;
             }
         }
         noteRequestUrl(url) {
             this.serviceTicket ??= extractServiceTicketFromUrl(url);
         }
-        // The navigation that hands the ticket over never gets a response (its host
-        // does not resolve), so the session watches requests as well.
-        whileWaitingForLogin(page) {
-            if (!this.isWatchingRequests) {
-                page.context().on('request', (request) => {
-                    this.noteRequestUrl(request.url());
-                });
-                this.isWatchingRequests = true;
+        async whileWaitingForLogin(page) {
+            if (this.isListening) {
+                return;
             }
-            return Promise.resolve();
+            this.isListening = true;
+            page.context().on('request', (request) => {
+                this.noteRequestUrl(request.url());
+            });
+            await page.exposeFunction(THICK_CLIENT_BINDING_NAME, (eventJson) => {
+                this.noteThickClientEvent(eventJson);
+            });
+            // The page is already loaded by now, so the bridge is set up on it
+            // directly as well as on whatever it loads next.
+            await page.addInitScript(THICK_CLIENT_BRIDGE_SCRIPT);
+            await page.evaluate(THICK_CLIENT_BRIDGE_SCRIPT);
         }
         isLoginComplete() {
             return this.serviceTicket !== null;
