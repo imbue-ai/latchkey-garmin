@@ -49,7 +49,25 @@ const SIGN_IN_URL = `https://sso.${DOMAIN}/mobile/sso/en/sign-in?clientId=${SSO_
 // The bridge the phone app gives the SSO page to report events through, and
 // the function the session exposes to stand in for the app.
 const THICK_CLIENT_BINDING_NAME = 'latchkeyGarminEvent';
-const THICK_CLIENT_BRIDGE_SCRIPT = `window.GMNEventHandler = { handleEvent: (event) => window.${THICK_CLIENT_BINDING_NAME}(event) };`;
+// The sign-in page is the phone app's dark theme: light text on a transparent
+// page that the app backs with a dark, phone-sized view. A desktop browser
+// needs the same backdrop, or the labels are white on white.
+const SIGN_IN_PAGE_STYLE = 'html, body { background: #111111; min-height: 100%; } ' +
+    '#portal { max-width: 440px; margin: 48px auto; padding: 0 16px; box-sizing: border-box; }';
+// Run on the sign-in page: stands in for the app's bridge and applies the style.
+const SIGN_IN_PAGE_SCRIPT = `(() => {
+  window.GMNEventHandler = { handleEvent: (event) => window.${THICK_CLIENT_BINDING_NAME}(event) };
+  const addStyle = () => {
+    const style = document.createElement('style');
+    style.textContent = ${JSON.stringify(SIGN_IN_PAGE_STYLE)};
+    document.head.append(style);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', addStyle);
+  } else {
+    addStyle();
+  }
+})();`;
 // Best effort: the embed page sets a load-balancer cookie that pins the ticket
 // exchange to the backend that knows the ticket.
 const SSO_EMBED_URL = `https://sso.${DOMAIN}/portal/sso/embed`;
@@ -128,9 +146,6 @@ export function createGarmin(sdk) {
             this.mfaToken = mfaToken;
             this.accessToken = accessToken;
             this.accessTokenExpiresAt = accessTokenExpiresAt;
-        }
-        get oauth1Token() {
-            return { key: this.oauthToken, secret: this.oauthTokenSecret };
         }
         injectIntoCurlCall(curlArguments) {
             if (this.accessToken === undefined) {
@@ -322,10 +337,10 @@ export function createGarmin(sdk) {
             await page.exposeFunction(THICK_CLIENT_BINDING_NAME, (eventJson) => {
                 this.noteThickClientEvent(eventJson);
             });
-            // The page is already loaded by now, so the bridge is set up on it
-            // directly as well as on whatever it loads next.
-            await page.addInitScript(THICK_CLIENT_BRIDGE_SCRIPT);
-            await page.evaluate(THICK_CLIENT_BRIDGE_SCRIPT);
+            // The page is already loaded by now, so the script runs on it directly
+            // as well as on whatever it loads next.
+            await page.addInitScript(SIGN_IN_PAGE_SCRIPT);
+            await page.evaluate(SIGN_IN_PAGE_SCRIPT);
         }
         isLoginComplete() {
             return this.serviceTicket !== null;
